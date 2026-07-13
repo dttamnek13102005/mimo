@@ -1,1 +1,2 @@
 nodriver==0.50.3
+python-dotenv==1.2.2

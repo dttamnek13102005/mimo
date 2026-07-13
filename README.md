@@ -14,7 +14,8 @@ Deploy `accounts.json` together with the source. Its structure is:
 {"interval_hours":4,"accounts":[{"account":"first@example.com","password":"secret"}]}
 ```
 
-Add one Railway service variable:
+Set the token either in the uploaded `.env` file or as a Railway service
+variable (the Railway variable takes precedence):
 
 - `TELEGRAM_BOT_TOKEN`: Telegram bot token inserted into `prompt.txt` at runtime
 
