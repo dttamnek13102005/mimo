@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import asyncio
+import html
 import re
 import time
+from urllib.parse import urljoin
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+import nodriver as uc
 
-from selenium_utils import (
+from nodriver_utils import (
+    CSS,
+    XPATH,
     Locator,
     click_element,
     click_when_present,
     error_summary,
-    replace_with_keyboard,
+    find_element,
+    find_elements,
+    navigate,
+    replace_input,
     set_reactive_value,
     wait_until_loaded,
 )
@@ -21,19 +26,18 @@ from selenium_utils import (
 
 TEMPMAIL_URL = "https://tempmail.id.vn/en"
 CUSTOM_MAIL_INPUT: Locator = (
-    By.XPATH,
-    "//input[@*[name()='wire:model']='customMail' or @placeholder='Input custom mail']",
+    XPATH,
+    "//input[@*[name()='wire:model']='customMail' "
+    "or @placeholder='Input custom mail']",
 )
-CREATE_MAIL_BUTTON: Locator = (By.XPATH, "//button[normalize-space(.)='Create']")
-MAILBOX_ADDRESS: Locator = (By.XPATH, "//button[contains(., '@')]")
-INBOX_MESSAGE_LINKS: Locator = (
-    By.CSS_SELECTOR, "tr.fi-clickable a[href*='/message/']"
-)
-REFRESH_INBOX_BUTTON: Locator = (By.XPATH, "//button[normalize-space(.)='Refresh']")
-MESSAGE_FRAME: Locator = (By.CSS_SELECTOR, "iframe[srcdoc]")
+CREATE_MAIL_BUTTON: Locator = (XPATH, "//button[normalize-space(.)='Create']")
+MAILBOX_ADDRESS: Locator = (XPATH, "//button[contains(., '@')]")
+INBOX_MESSAGE_LINKS: Locator = (CSS, "tr.fi-clickable a[href*='/message/']")
+REFRESH_INBOX_BUTTON: Locator = (XPATH, "//button[normalize-space(.)='Refresh']")
 
 XIAOMI_OTP_PATTERN = re.compile(
-    r"verification\s+code\s*(?:is)?\s*:\s*([0-9]{4,8})", re.IGNORECASE
+    r"verification\s+code\s*(?:is)?\s*:\s*([0-9]{4,8})",
+    re.IGNORECASE,
 )
 CONTEXTUAL_OTP_PATTERN = re.compile(
     r"(?:otp|one[- ]?time(?:\s+pass(?:word|code))?|verification|verify|security)"
@@ -41,20 +45,20 @@ CONTEXTUAL_OTP_PATTERN = re.compile(
     re.IGNORECASE,
 )
 GENERIC_OTP_PATTERN = re.compile(r"(?<!\d)([0-9]{4,8})(?!\d)")
+HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 
 
-def fill_custom_email(
-    driver: webdriver.Chrome, username: str, timeout: int = 5
+async def fill_custom_email(
+    tab: uc.Tab,
+    username: str,
+    timeout: int = 5,
 ) -> bool:
     print("Waiting for custom mail input...")
     try:
-        input_element = WebDriverWait(driver, timeout).until(
-            EC.element_to_be_clickable(CUSTOM_MAIL_INPUT)
-        )
-        replace_with_keyboard(driver, input_element, username)
-        set_reactive_value(driver, input_element, username, timeout)
+        input_element = await find_element(tab, CUSTOM_MAIL_INPUT, timeout)
+        await replace_input(input_element, username)
+        await set_reactive_value(input_element, username)
         print(f"Custom mailbox name entered: {username}")
-        time.sleep(1)
         return True
     except Exception as error:
         print(f"Could not enter the custom mailbox name: {error_summary(error)}")
@@ -69,77 +73,75 @@ def extract_otp(text: str) -> str | None:
     return None
 
 
-def read_current_email_text(driver: webdriver.Chrome) -> str:
-    text_parts = [driver.find_element(By.TAG_NAME, "body").text]
-    for frame in driver.find_elements(*MESSAGE_FRAME):
-        try:
-            driver.switch_to.frame(frame)
-            text_parts.append(driver.find_element(By.TAG_NAME, "body").text)
-        except Exception:
-            pass
-        finally:
-            driver.switch_to.default_content()
+def html_to_text(content: str) -> str:
+    return html.unescape(HTML_TAG_PATTERN.sub(" ", content))
+
+
+async def read_current_email_text(tab: uc.Tab) -> str:
+    text_parts: list[str] = []
+    for frame_element in await tab.select_all("iframe[srcdoc]", timeout=0):
+        source = frame_element.attrs.get("srcdoc")
+        if source:
+            text_parts.append(html_to_text(source))
+
+    try:
+        for frame in await tab.get_frames():
+            try:
+                text_parts.append(html_to_text(await frame.get_content()))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if not text_parts:
+        body = await find_element(tab, (CSS, "body"), timeout=2)
+        text_parts.append(body.text_all)
     return "\n".join(text_parts)
 
 
-def refresh_inbox(driver: webdriver.Chrome) -> None:
-    refresh_buttons = driver.find_elements(*REFRESH_INBOX_BUTTON)
+async def refresh_inbox(tab: uc.Tab) -> None:
+    refresh_buttons = await find_elements(tab, REFRESH_INBOX_BUTTON)
     if refresh_buttons:
-        click_element(driver, refresh_buttons[0])
+        await click_element(refresh_buttons[0])
 
 
-def first_message_url(driver: webdriver.Chrome) -> str | None:
-    message_links = driver.find_elements(*INBOX_MESSAGE_LINKS)
-    return message_links[0].get_attribute("href") if message_links else None
+async def first_message_url(tab: uc.Tab) -> str | None:
+    message_links = await find_elements(tab, INBOX_MESSAGE_LINKS)
+    if not message_links:
+        return None
+    href = message_links[0].attrs.get("href")
+    return urljoin(tab.target.url, href) if href else None
 
 
-def wait_for_first_email_otp(
-    driver: webdriver.Chrome, timeout: int
-) -> str | None:
+async def wait_for_first_email_otp(tab: uc.Tab, timeout: int) -> str | None:
     deadline = time.monotonic() + timeout
+    message_opened = False
     while time.monotonic() < deadline:
-        message_url = first_message_url(driver)
-        if not message_url:
-            refresh_inbox(driver)
-            time.sleep(2)
-            continue
+        if not message_opened:
+            message_url = await first_message_url(tab)
+            if not message_url:
+                await refresh_inbox(tab)
+                await asyncio.sleep(2)
+                continue
 
-        print("First email received. Opening it...")
-        driver.get(message_url)
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located(MESSAGE_FRAME))
-        while time.monotonic() < deadline:
-            try:
-                otp = extract_otp(read_current_email_text(driver))
-                if otp:
-                    return otp
-            except Exception:
-                pass
-            time.sleep(1)
+            print("First email received. Opening it...")
+            await navigate(tab, message_url, timeout=10)
+            message_opened = True
+
+        try:
+            otp = extract_otp(await read_current_email_text(tab))
+            if otp:
+                return otp
+        except Exception:
+            pass
+        await asyncio.sleep(1)
     return None
 
 
-def open_new_tab(driver: webdriver.Chrome, timeout: int) -> str:
-    existing_handles = driver.window_handles
-    driver.execute_script("window.open('');")
-    WebDriverWait(driver, timeout).until(EC.new_window_is_opened(existing_handles))
-    return next(
-        handle for handle in driver.window_handles if handle not in existing_handles
-    )
-
-
-def close_tab_and_return(
-    driver: webdriver.Chrome, tab_handle: str, return_handle: str
-) -> None:
-    if tab_handle in driver.window_handles:
-        driver.switch_to.window(tab_handle)
-        driver.close()
-    driver.switch_to.window(return_handle)
-
-
-def get_otp_from_tempmail(
-    driver: webdriver.Chrome,
+async def get_otp_from_tempmail(
+    browser: uc.Browser,
     email: str,
-    original_window: str,
+    original_tab: uc.Tab,
     timeout: int = 5,
     otp_timeout: int = 120,
 ) -> str | None:
@@ -148,27 +150,29 @@ def get_otp_from_tempmail(
         raise ValueError("Cannot create tempmail address: account email is empty.")
 
     print(f"Mailbox prefix: {username}")
-    tempmail_window = open_new_tab(driver, timeout)
-    driver.switch_to.window(tempmail_window)
+    tempmail_tab = await browser.get(TEMPMAIL_URL, new_tab=True)
     try:
-        driver.get(TEMPMAIL_URL)
-        wait_until_loaded(driver, timeout)
-        if not fill_custom_email(driver, username, timeout):
+        await wait_until_loaded(tempmail_tab, timeout)
+        if not await fill_custom_email(tempmail_tab, username, timeout):
             return None
-        if not click_when_present(
-            driver, CREATE_MAIL_BUTTON, "Create Email button", timeout
+        if not await click_when_present(
+            tempmail_tab,
+            CREATE_MAIL_BUTTON,
+            "Create Email button",
+            timeout,
         ):
             return None
-        WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located(MAILBOX_ADDRESS)
-        )
+        await find_element(tempmail_tab, MAILBOX_ADDRESS, timeout)
         print(f"Waiting for the first email for up to {otp_timeout}s...")
-        otp = wait_for_first_email_otp(driver, otp_timeout)
+        otp = await wait_for_first_email_otp(tempmail_tab, otp_timeout)
         print(f"OTP extracted: {otp}" if otp else "OTP was not received in time.")
         return otp
     except Exception as error:
         print(f"TempMail flow failed: {error_summary(error)}")
         return None
     finally:
-        close_tab_and_return(driver, tempmail_window, original_window)
-        print("Returned to the login tab.")
+        try:
+            await tempmail_tab.close()
+        finally:
+            await original_tab.bring_to_front()
+            print("Returned to the login tab.")

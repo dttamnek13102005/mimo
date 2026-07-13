@@ -14,8 +14,7 @@ venv/
 env/
 
 # Local environment and secrets
-.env
-.env.*
+
 !.env.example
 
 # Build and package output

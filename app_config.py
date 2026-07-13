@@ -67,6 +67,45 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def normalize_rotation_config(config: Any, source: str) -> dict[str, Any]:
+    if not isinstance(config, dict):
+        raise ValueError(f"Config root from {source} must be a JSON object.")
+
+    accounts = config.get("accounts")
+    if not isinstance(accounts, list) or not accounts:
+        raise ValueError(f"Config from {source} must contain an 'accounts' list.")
+
+    normalized_accounts = []
+    for position, item in enumerate(accounts, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Account #{position} from {source} must be an object.")
+        if item.get("enabled", True) is False:
+            continue
+
+        account = str(item.get("account", "")).strip()
+        password = str(item.get("password", ""))
+        if not account or not password:
+            raise ValueError(
+                f"Enabled account #{position} from {source} must have "
+                "'account' and 'password'."
+            )
+        normalized_accounts.append({"account": account, "password": password})
+
+    if not normalized_accounts:
+        raise ValueError(f"Config from {source} has no enabled accounts.")
+
+    try:
+        interval_hours = float(config.get("interval_hours", 4))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"'interval_hours' from {source} must be a number.") from error
+    if not math.isfinite(interval_hours) or interval_hours <= 0:
+        raise ValueError(
+            f"'interval_hours' from {source} must be a finite number above zero."
+        )
+
+    return {"interval_hours": interval_hours, "accounts": normalized_accounts}
+
+
 def load_rotation_config(config_path: Path) -> dict[str, Any]:
     try:
         config = json.loads(config_path.read_text(encoding="utf-8-sig"))
@@ -77,39 +116,7 @@ def load_rotation_config(config_path: Path) -> dict[str, Any]:
             f"Config file is not valid JSON ({config_path}): {error}"
         ) from error
 
-    if not isinstance(config, dict):
-        raise ValueError("Config root must be a JSON object.")
-
-    accounts = config.get("accounts")
-    if not isinstance(accounts, list) or not accounts:
-        raise ValueError("Config must contain a non-empty 'accounts' list.")
-
-    normalized_accounts = []
-    for position, item in enumerate(accounts, start=1):
-        if not isinstance(item, dict):
-            raise ValueError(f"Account #{position} must be a JSON object.")
-        if item.get("enabled", True) is False:
-            continue
-
-        account = str(item.get("account", "")).strip()
-        password = str(item.get("password", ""))
-        if not account or not password:
-            raise ValueError(
-                f"Enabled account #{position} must have 'account' and 'password'."
-            )
-        normalized_accounts.append({"account": account, "password": password})
-
-    if not normalized_accounts:
-        raise ValueError("Config does not contain any enabled accounts.")
-
-    try:
-        interval_hours = float(config.get("interval_hours", 4))
-    except (TypeError, ValueError) as error:
-        raise ValueError("'interval_hours' must be a number.") from error
-    if not math.isfinite(interval_hours) or interval_hours <= 0:
-        raise ValueError("'interval_hours' must be a finite number above zero.")
-
-    return {"interval_hours": interval_hours, "accounts": normalized_accounts}
+    return normalize_rotation_config(config, str(config_path))
 
 
 def apply_interval_override(

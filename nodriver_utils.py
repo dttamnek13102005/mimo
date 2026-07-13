@@ -1,0 +1,198 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shutil
+import time
+from pathlib import Path
+
+import nodriver as uc
+from nodriver.core.config import find_chrome_executable
+
+
+CSS = "css"
+XPATH = "xpath"
+Locator = tuple[str, str]
+
+
+def error_summary(error: Exception) -> str:
+    lines = [line.strip() for line in str(error).splitlines() if line.strip()]
+    return lines[0] if lines else type(error).__name__
+
+
+def find_chromium_binary() -> str:
+    configured_path = os.environ.get("CHROME_BIN", "").strip()
+    if configured_path:
+        return configured_path
+
+    browser_path = next(
+        (
+            path
+            for name in (
+                "chromium",
+                "chromium-browser",
+                "google-chrome",
+                "chrome",
+            )
+            if (path := shutil.which(name))
+        ),
+        None,
+    )
+    if not browser_path:
+        detected_path = find_chrome_executable()
+        if detected_path and Path(detected_path).is_file():
+            browser_path = str(detected_path)
+    if not browser_path:
+        raise RuntimeError(
+            "Chrome/Chromium was not found. Set CHROME_BIN to its executable path."
+        )
+    return browser_path
+
+
+async def build_browser(headless: bool) -> uc.Browser:
+    browser_path = find_chromium_binary()
+    print(f"Starting nodriver with Chromium: {browser_path} (headless={headless})")
+    return await uc.start(
+        headless=headless,
+        browser_executable_path=browser_path,
+        sandbox=False,
+        browser_args=[
+            "--window-size=1440,1000",
+            "--disable-notifications",
+            "--disable-popup-blocking",
+        ],
+    )
+
+
+async def find_element(
+    tab: uc.Tab,
+    locator: Locator,
+    timeout: float = 10,
+) -> uc.Element:
+    strategy, selector = locator
+    if strategy == CSS:
+        element = await tab.select(selector, timeout=timeout)
+    elif strategy == XPATH:
+        matches = await tab.xpath(selector, timeout=timeout)
+        element = next((item for item in matches if item is not None), None)
+    else:
+        raise ValueError(f"Unsupported locator strategy: {strategy}")
+
+    if element is None:
+        raise TimeoutError(f"Element was not found after {timeout:g}s: {selector}")
+    return element
+
+
+async def find_elements(
+    tab: uc.Tab,
+    locator: Locator,
+    timeout: float = 0,
+) -> list[uc.Element]:
+    strategy, selector = locator
+    if strategy == CSS:
+        return await tab.select_all(selector, timeout=timeout)
+    if strategy == XPATH:
+        return [
+            item
+            for item in await tab.xpath(selector, timeout=timeout)
+            if item is not None
+        ]
+    raise ValueError(f"Unsupported locator strategy: {strategy}")
+
+
+async def click_element(element: uc.Element) -> None:
+    try:
+        await element.mouse_click()
+    except Exception:
+        await element.click()
+
+
+async def click_when_present(
+    tab: uc.Tab,
+    locator: Locator,
+    element_name: str,
+    timeout: float = 3,
+) -> bool:
+    print(f"Waiting for '{element_name}'...")
+    try:
+        element = await find_element(tab, locator, timeout)
+        await click_element(element)
+        print(f"Clicked '{element_name}'.")
+        await tab.sleep(1)
+        return True
+    except Exception as error:
+        print(f"Could not click '{element_name}': {error_summary(error)}")
+        return False
+
+
+async def replace_input(element: uc.Element, value: str) -> None:
+    await click_element(element)
+    await element.clear_input()
+    await element.send_keys(value)
+
+
+async def set_reactive_value(element: uc.Element, value: str) -> None:
+    encoded_value = json.dumps(value)
+    actual_value = await element.apply(
+        f"""
+        element => {{
+            const value = {encoded_value};
+            const setter = Object.getOwnPropertyDescriptor(
+                Object.getPrototypeOf(element), 'value'
+            ).set;
+            setter.call(element, value);
+            element.dispatchEvent(new InputEvent('input', {{
+                bubbles: true,
+                data: value,
+                inputType: 'insertText',
+            }}));
+            element.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            return element.value;
+        }}
+        """
+    )
+    if actual_value != value:
+        raise RuntimeError("The page did not accept the requested input value.")
+
+
+async def wait_until_loaded(tab: uc.Tab, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            ready_state = await tab.evaluate(
+                "document.readyState", return_by_value=True
+            )
+            if ready_state == "complete":
+                await find_element(tab, (CSS, "body"), timeout=1)
+                return
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
+    raise TimeoutError(f"Page did not finish loading after {timeout:g}s.")
+
+
+async def navigate(tab: uc.Tab, url: str, timeout: float = 30) -> None:
+    await tab.send(uc.cdp.page.navigate(url))
+    await wait_until_loaded(tab, timeout)
+
+
+async def wait_for_attribute(
+    tab: uc.Tab,
+    locator: Locator,
+    name: str,
+    expected_value: str,
+    timeout: float,
+) -> uc.Element:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            element = await find_element(tab, locator, timeout=0.5)
+            if element.attrs.get(name) == expected_value:
+                return element
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
+    raise TimeoutError(
+        f"Element attribute {name!r} did not become {expected_value!r}."
+    )

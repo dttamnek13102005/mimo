@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "provider": "python",
+  "deploy": {
+    "startCommand": "python app.py --headless",
+    "aptPackages": [
+      "chromium"
+    ],
+    "variables": {
+      "CHROME_BIN": "/usr/bin/chromium",
+      "LANG": "en_US.UTF-8",
+      "LC_ALL": "en_US.UTF-8",
+      "TZ": "Asia/Bangkok"
+    }
+  }
+}

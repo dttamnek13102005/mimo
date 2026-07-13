@@ -1,1 +1,1 @@
-selenium>=4.34.0
+nodriver==0.50.3

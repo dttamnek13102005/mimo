@@ -1,21 +1,23 @@
 from __future__ import annotations
 
 import argparse
-import time
+import os
+import re
 from pathlib import Path
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+import nodriver as uc
 
-from selenium_utils import (
+from nodriver_utils import (
+    CSS,
+    XPATH,
     Locator,
     click_element,
     click_when_present,
     error_summary,
-    replace_with_keyboard,
+    find_element,
+    replace_input,
     set_reactive_value,
+    wait_for_attribute,
     wait_until_loaded,
 )
 from tempmail_flow import get_otp_from_tempmail
@@ -24,58 +26,65 @@ from tempmail_flow import get_otp_from_tempmail
 PROMPT_PATH = Path(__file__).resolve().with_name("prompt.txt")
 WORKSPACE_WAIT_SECONDS = 120
 POST_SEND_WAIT_SECONDS = 120
+ENV_PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
 
 TRY_NOW_BUTTON: Locator = (
-    By.XPATH, "//button[contains(normalize-space(.), 'Try Now')]"
+    XPATH,
+    "//button[contains(normalize-space(.), 'Try Now')]",
 )
 CREATE_NOW_BUTTON: Locator = (
-    By.CSS_SELECTOR, "button[data-track-id='claw_welcome_create_btn']"
+    CSS,
+    "button[data-track-id='claw_welcome_create_btn']",
 )
-TERMS_CHECKBOX: Locator = (By.CSS_SELECTOR, "input.ant-checkbox-input[type='checkbox']")
-ACCOUNT_INPUT: Locator = (By.CSS_SELECTOR, "input[name='account']")
-PASSWORD_INPUT: Locator = (By.CSS_SELECTOR, "input[name='password']")
+TERMS_CHECKBOX: Locator = (CSS, "input.ant-checkbox-input[type='checkbox']")
+ACCOUNT_INPUT: Locator = (CSS, "input[name='account']")
+PASSWORD_INPUT: Locator = (CSS, "input[name='password']")
 SIGN_IN_BUTTON: Locator = (
-    By.XPATH, "//button[@type='submit' and contains(., 'Sign in')]"
+    XPATH,
+    "//button[@type='submit' and contains(., 'Sign in')]",
 )
 SEND_EMAIL_BUTTON: Locator = (
-    By.XPATH, "//button[@type='submit' and contains(., 'Send')]"
+    XPATH,
+    "//button[@type='submit' and contains(., 'Send')]",
 )
-OTP_INPUT: Locator = (By.CSS_SELECTOR, "input[name='ticket'][placeholder='Enter code']")
+OTP_INPUT: Locator = (CSS, "input[name='ticket'][placeholder='Enter code']")
 OTP_SUBMIT_BUTTON: Locator = (
-    By.XPATH,
-    "//button[@type='submit' and not(@disabled) and .//span[normalize-space(.)='Submit']]",
+    XPATH,
+    "//button[@type='submit' and not(@disabled) "
+    "and .//span[normalize-space(.)='Submit']]",
 )
 CREATE_CONFIRMATION_CHECKBOX: Locator = (
-    By.XPATH,
+    XPATH,
     "//button[@data-track-id='claw_create_confirm_btn']"
     "/ancestor::*[.//button[@role='checkbox']][1]"
     "//button[@role='checkbox' and @aria-disabled='false'][1]",
 )
 CONTINUE_CREATING_BUTTON: Locator = (
-    By.CSS_SELECTOR, "button[data-track-id='claw_create_confirm_btn']"
+    CSS,
+    "button[data-track-id='claw_create_confirm_btn']",
 )
 PROMPT_TEXTAREA: Locator = (
-    By.CSS_SELECTOR,
+    CSS,
     "textarea[placeholder='Ask me anything! Hold Shift+Enter to start a new line.']",
 )
 SEND_PROMPT_BUTTON: Locator = (
-    By.CSS_SELECTOR, "button[data-track-id='claw_send_btn']"
+    CSS,
+    "button[data-track-id='claw_send_btn']",
 )
 
 
-def fill_login_credentials(
-    driver: webdriver.Chrome,
+async def fill_login_credentials(
+    tab: uc.Tab,
     account: str,
     password: str,
     timeout: int = 5,
 ) -> bool:
     print("Waiting for login inputs...")
     try:
-        wait = WebDriverWait(driver, timeout)
-        account_input = wait.until(EC.element_to_be_clickable(ACCOUNT_INPUT))
-        password_input = wait.until(EC.element_to_be_clickable(PASSWORD_INPUT))
-        replace_with_keyboard(driver, account_input, account)
-        replace_with_keyboard(driver, password_input, password)
+        account_input = await find_element(tab, ACCOUNT_INPUT, timeout)
+        password_input = await find_element(tab, PASSWORD_INPUT, timeout)
+        await replace_input(account_input, account)
+        await replace_input(password_input, password)
         print("Login credentials entered.")
         return True
     except Exception as error:
@@ -83,15 +92,13 @@ def fill_login_credentials(
         return False
 
 
-def submit_otp(driver: webdriver.Chrome, otp: str, timeout: int = 10) -> bool:
+async def submit_otp(tab: uc.Tab, otp: str, timeout: int = 10) -> bool:
     print("Waiting for the verification-code input...")
     try:
-        wait = WebDriverWait(driver, timeout)
-        ticket_input = wait.until(EC.element_to_be_clickable(OTP_INPUT))
-        replace_with_keyboard(driver, ticket_input, otp)
-        wait.until(lambda browser: ticket_input.get_attribute("value") == otp)
-        submit_button = wait.until(EC.element_to_be_clickable(OTP_SUBMIT_BUTTON))
-        click_element(driver, submit_button)
+        ticket_input = await find_element(tab, OTP_INPUT, timeout)
+        await replace_input(ticket_input, otp)
+        submit_button = await find_element(tab, OTP_SUBMIT_BUTTON, timeout)
+        await click_element(submit_button)
         print("OTP submitted.")
         return True
     except Exception as error:
@@ -99,28 +106,25 @@ def submit_otp(driver: webdriver.Chrome, otp: str, timeout: int = 10) -> bool:
         return False
 
 
-def ensure_creation_confirmation(
-    driver: webdriver.Chrome, timeout: int = 10
-) -> bool:
+async def ensure_creation_confirmation(tab: uc.Tab, timeout: int = 10) -> bool:
     print("Checking the creation confirmation...")
     try:
-        wait = WebDriverWait(driver, timeout)
-        checkbox = wait.until(EC.presence_of_element_located(CREATE_CONFIRMATION_CHECKBOX))
-        if checkbox.get_attribute("aria-checked") != "true":
-            checkbox = wait.until(EC.element_to_be_clickable(CREATE_CONFIRMATION_CHECKBOX))
-            click_element(driver, checkbox)
-            wait.until(
-                lambda browser: browser.find_element(
-                    *CREATE_CONFIRMATION_CHECKBOX
-                ).get_attribute("aria-checked")
-                == "true"
+        checkbox = await find_element(tab, CREATE_CONFIRMATION_CHECKBOX, timeout)
+        if checkbox.attrs.get("aria-checked") != "true":
+            await click_element(checkbox)
+            await wait_for_attribute(
+                tab,
+                CREATE_CONFIRMATION_CHECKBOX,
+                "aria-checked",
+                "true",
+                timeout,
             )
             print("Creation confirmation checked.")
         else:
             print("Creation confirmation was already checked.")
 
-        continue_button = wait.until(EC.element_to_be_clickable(CONTINUE_CREATING_BUTTON))
-        click_element(driver, continue_button)
+        continue_button = await find_element(tab, CONTINUE_CREATING_BUTTON, timeout)
+        await click_element(continue_button)
         print("Clicked 'Continue Creating'.")
         return True
     except Exception as error:
@@ -132,89 +136,110 @@ def load_prompt(prompt_path: Path) -> str:
     prompt_text = prompt_path.read_text(encoding="utf-8-sig").strip()
     if not prompt_text:
         raise ValueError(f"Prompt file is empty: {prompt_path}")
-    return prompt_text
+
+    variable_names = set(ENV_PLACEHOLDER_PATTERN.findall(prompt_text))
+    missing_names = sorted(name for name in variable_names if not os.environ.get(name))
+    if missing_names:
+        raise ValueError(
+            "Missing environment variable(s) required by prompt.txt: "
+            + ", ".join(missing_names)
+        )
+    return ENV_PLACEHOLDER_PATTERN.sub(
+        lambda match: os.environ[match.group(1)], prompt_text
+    )
 
 
-def send_prompt_after_creation(
-    driver: webdriver.Chrome,
+async def send_prompt_after_creation(
+    tab: uc.Tab,
     prompt_path: Path,
     wait_seconds: int = WORKSPACE_WAIT_SECONDS,
     timeout: int = 30,
 ) -> bool:
     try:
         prompt_text = load_prompt(prompt_path)
-        print(f"Waiting {wait_seconds}s for the workspace to become ready...")
-        time.sleep(wait_seconds)
-        wait = WebDriverWait(driver, timeout)
-        textarea = wait.until(EC.element_to_be_clickable(PROMPT_TEXTAREA))
-        set_reactive_value(driver, textarea, prompt_text, timeout)
-        send_button = wait.until(EC.element_to_be_clickable(SEND_PROMPT_BUTTON))
-        click_element(driver, send_button)
+        print(f"Waiting up to {wait_seconds + timeout}s for the workspace...")
+        textarea = await find_element(
+            tab,
+            PROMPT_TEXTAREA,
+            timeout=wait_seconds + timeout,
+        )
+        await set_reactive_value(textarea, prompt_text)
+        send_button = await find_element(tab, SEND_PROMPT_BUTTON, timeout)
+        await click_element(send_button)
         print("Prompt sent.")
         print(
             f"Waiting {POST_SEND_WAIT_SECONDS}s after sending before closing "
             "the browser..."
         )
-        time.sleep(POST_SEND_WAIT_SECONDS)
+        await tab.sleep(POST_SEND_WAIT_SECONDS)
         return True
     except Exception as error:
         print(f"Could not send prompt: {error_summary(error)}")
         return False
 
 
-def request_verification_code(
-    driver: webdriver.Chrome, account: str, password: str
+async def request_verification_code(
+    tab: uc.Tab,
+    account: str,
+    password: str,
 ) -> bool:
-    click_when_present(driver, TRY_NOW_BUTTON, "Try Now")
-    click_when_present(driver, CREATE_NOW_BUTTON, "Create Now")
-    click_when_present(driver, TERMS_CHECKBOX, "Checkbox")
-    if not fill_login_credentials(driver, account, password):
+    await click_when_present(tab, TRY_NOW_BUTTON, "Try Now")
+    await click_when_present(tab, CREATE_NOW_BUTTON, "Create Now")
+    await click_when_present(tab, TERMS_CHECKBOX, "Checkbox")
+    if not await fill_login_credentials(tab, account, password):
         return False
-    if not click_when_present(driver, SIGN_IN_BUTTON, "Sign in"):
+    if not await click_when_present(tab, SIGN_IN_BUTTON, "Sign in"):
         return False
-    return click_when_present(driver, SEND_EMAIL_BUTTON, "Send Email")
+    return await click_when_present(tab, SEND_EMAIL_BUTTON, "Send Email")
 
 
-def complete_creation_flow(driver: webdriver.Chrome, otp: str) -> bool:
-    if not submit_otp(driver, otp):
+async def complete_creation_flow(tab: uc.Tab, otp: str) -> bool:
+    if not await submit_otp(tab, otp):
         return False
-    if not click_when_present(
-        driver, CREATE_NOW_BUTTON, "Create Now after OTP", timeout=10
+    if not await click_when_present(
+        tab,
+        CREATE_NOW_BUTTON,
+        "Create Now after OTP",
+        timeout=10,
     ):
         return False
-    if not ensure_creation_confirmation(driver):
+    if not await ensure_creation_confirmation(tab):
         return False
-    return send_prompt_after_creation(driver, PROMPT_PATH)
+    return await send_prompt_after_creation(tab, PROMPT_PATH)
 
 
-def save_screenshot(driver: webdriver.Chrome, screenshot_path: str) -> None:
+async def save_screenshot(tab: uc.Tab, screenshot_path: str) -> None:
     output_path = Path(screenshot_path).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    driver.save_screenshot(str(output_path))
+    image_format = "png" if output_path.suffix.lower() == ".png" else "jpeg"
+    await tab.save_screenshot(str(output_path), format=image_format)
     print(f"Screenshot saved: {output_path}")
 
 
-def run_workflow(driver: webdriver.Chrome, args: argparse.Namespace) -> bool:
+async def run_workflow(
+    browser: uc.Browser,
+    tab: uc.Tab,
+    args: argparse.Namespace,
+) -> bool:
     account = args.account.strip()
     password = args.password
     print(f"Opening: {args.url}")
-    driver.get(args.url)
-    wait_until_loaded(driver, args.timeout)
-    print(f"Loaded URL: {driver.current_url}")
-    print(f"Page title: {driver.title}")
+    await wait_until_loaded(tab, args.timeout)
+    await tab
+    print(f"Loaded URL: {tab.target.url}")
+    print(f"Page title: {tab.target.title}")
 
-    if not request_verification_code(driver, account, password):
+    if not await request_verification_code(tab, account, password):
         return False
 
-    login_window = driver.current_window_handle
-    otp = get_otp_from_tempmail(
-        driver,
+    otp = await get_otp_from_tempmail(
+        browser,
         account,
-        original_window=login_window,
+        original_tab=tab,
         timeout=5,
         otp_timeout=args.otp_timeout,
     )
-    completed = bool(otp) and complete_creation_flow(driver, otp)
+    completed = bool(otp) and await complete_creation_flow(tab, otp)
     if args.screenshot:
-        save_screenshot(driver, args.screenshot)
+        await save_screenshot(tab, args.screenshot)
     return completed
