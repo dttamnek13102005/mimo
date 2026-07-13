@@ -8,6 +8,9 @@ from mimo_workflow import run_workflow
 from nodriver_utils import build_browser, error_summary
 
 
+FAILED_CYCLE_BACKOFF_SECONDS = 5 * 60
+
+
 async def keep_browser_available(args: argparse.Namespace) -> None:
     if args.keep_open and not args.headless:
         print("Chrome is being kept open. Close it manually when done.")
@@ -24,8 +27,14 @@ async def run_account_session(
     args.password = password
     browser = None
     try:
-        browser = await build_browser(args.headless)
-        tab = await browser.get(args.url)
+        browser = await asyncio.wait_for(
+            build_browser(args.headless),
+            timeout=max(30, args.timeout),
+        )
+        tab = await asyncio.wait_for(
+            browser.get(args.url),
+            timeout=max(30, args.timeout),
+        )
         completed = await run_workflow(browser, tab, args)
         await keep_browser_available(args)
         return completed
@@ -49,6 +58,7 @@ async def run_rotation(
     interval_seconds = interval_hours * 60 * 60
     account_index = 0
     runs_completed = 0
+    consecutive_failures = 0
     loop = asyncio.get_running_loop()
     next_run = loop.time()
 
@@ -82,7 +92,25 @@ async def run_rotation(
             print(f"Test rotation finished after {runs_completed} account session(s).")
             return
 
-        next_run += interval_seconds
+        if not completed:
+            consecutive_failures += 1
+            next_run = loop.time()
+            if consecutive_failures >= len(accounts):
+                print(
+                    "All accounts failed in this cycle; waiting 5 minutes before "
+                    "retrying to avoid a tight failure loop."
+                )
+                await asyncio.sleep(FAILED_CYCLE_BACKOFF_SECONDS)
+                consecutive_failures = 0
+                continue
+            print(
+                f"Session failed; switching immediately to "
+                f"{accounts[account_index]['account']}."
+            )
+            continue
+
+        consecutive_failures = 0
+        next_run = loop.time() + interval_seconds
         wait_seconds = max(0.0, next_run - loop.time())
         next_run_at = datetime.now().astimezone() + timedelta(seconds=wait_seconds)
         print(

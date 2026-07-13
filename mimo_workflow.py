@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import re
+import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import nodriver as uc
 
 from nodriver_utils import (
     CSS,
-    XPATH,
+    TEXT,
     Locator,
     click_element,
     click_when_present,
@@ -20,7 +23,11 @@ from nodriver_utils import (
     wait_for_attribute,
     wait_until_loaded,
 )
-from tempmail_flow import get_otp_from_tempmail
+from tempmail_flow import (
+    close_tempmail_inbox,
+    prepare_tempmail_inbox,
+    wait_for_otp_from_tempmail,
+)
 
 
 PROMPT_PATH = Path(__file__).resolve().with_name("prompt.txt")
@@ -29,8 +36,8 @@ POST_SEND_WAIT_SECONDS = 120
 ENV_PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
 
 TRY_NOW_BUTTON: Locator = (
-    XPATH,
-    "//button[contains(normalize-space(.), 'Try Now')]",
+    TEXT,
+    "Try Now",
 )
 CREATE_NOW_BUTTON: Locator = (
     CSS,
@@ -40,24 +47,21 @@ TERMS_CHECKBOX: Locator = (CSS, "input.ant-checkbox-input[type='checkbox']")
 ACCOUNT_INPUT: Locator = (CSS, "input[name='account']")
 PASSWORD_INPUT: Locator = (CSS, "input[name='password']")
 SIGN_IN_BUTTON: Locator = (
-    XPATH,
-    "//button[@type='submit' and contains(., 'Sign in')]",
+    TEXT,
+    "Sign in",
 )
 SEND_EMAIL_BUTTON: Locator = (
-    XPATH,
-    "//button[@type='submit' and contains(., 'Send')]",
+    TEXT,
+    "Send",
 )
 OTP_INPUT: Locator = (CSS, "input[name='ticket'][placeholder='Enter code']")
 OTP_SUBMIT_BUTTON: Locator = (
-    XPATH,
-    "//button[@type='submit' and not(@disabled) "
-    "and .//span[normalize-space(.)='Submit']]",
+    CSS,
+    "button[type='submit']:not([disabled])",
 )
 CREATE_CONFIRMATION_CHECKBOX: Locator = (
-    XPATH,
-    "//button[@data-track-id='claw_create_confirm_btn']"
-    "/ancestor::*[.//button[@role='checkbox']][1]"
-    "//button[@role='checkbox' and @aria-disabled='false'][1]",
+    CSS,
+    "button[role='checkbox'][aria-disabled='false']",
 )
 CONTINUE_CREATING_BUTTON: Locator = (
     CSS,
@@ -82,13 +86,90 @@ async def fill_login_credentials(
     print("Waiting for login inputs...")
     try:
         account_input = await find_element(tab, ACCOUNT_INPUT, timeout)
-        password_input = await find_element(tab, PASSWORD_INPUT, timeout)
         await replace_input(account_input, account)
+        account_input = await find_element(tab, ACCOUNT_INPUT, timeout)
+        await set_reactive_value(account_input, account)
+
+        password_input = await find_element(tab, PASSWORD_INPUT, timeout)
         await replace_input(password_input, password)
+        password_input = await find_element(tab, PASSWORD_INPUT, timeout)
+        await set_reactive_value(password_input, password)
         print("Login credentials entered.")
         return True
     except Exception as error:
         print(f"Could not enter login credentials: {error_summary(error)}")
+        return False
+
+
+async def ensure_terms_accepted(tab: uc.Tab, timeout: int = 10) -> bool:
+    print("Checking account terms checkbox...")
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            checkbox = await find_element(tab, TERMS_CHECKBOX, timeout=1)
+            checked = await checkbox.apply("element => element.checked === true")
+            if checked:
+                print("Account terms accepted.")
+                return True
+            await click_element(checkbox)
+        except Exception as error:
+            last_error = error
+        await asyncio.sleep(0.25)
+
+    summary = error_summary(last_error) if last_error else "Timed out"
+    print(f"Could not accept account terms: {summary}")
+    return False
+
+
+async def submit_sign_in(tab: uc.Tab, timeout: int = 10) -> bool:
+    print("Submitting sign-in...")
+    try:
+        account_input = await find_element(tab, ACCOUNT_INPUT, timeout)
+        password_input = await find_element(tab, PASSWORD_INPUT, timeout)
+        await account_input.apply("element => element.blur()")
+        await password_input.apply("element => element.blur()")
+
+        sign_in_button = await find_element(tab, SIGN_IN_BUTTON, timeout)
+        position = await sign_in_button.get_position()
+        if not position or position.width <= 0 or position.height <= 0:
+            raise RuntimeError("The visible Sign in button had no clickable position.")
+        await sign_in_button.mouse_click()
+        print("Sign-in submitted with a trusted mouse event.")
+
+        await asyncio.sleep(5)
+        try:
+            await find_element(tab, SEND_EMAIL_BUTTON, timeout=1)
+            return True
+        except Exception:
+            pass
+
+        try:
+            password_input = await find_element(tab, PASSWORD_INPUT, timeout=1)
+        except Exception:
+            return True
+
+        await password_input.apply("element => element.focus()")
+        key_options = {
+            "code": "Enter",
+            "key": "Enter",
+            "windows_virtual_key_code": 13,
+            "native_virtual_key_code": 13,
+        }
+        await tab.send(uc.cdp.input_.dispatch_key_event("rawKeyDown", **key_options))
+        await tab.send(
+            uc.cdp.input_.dispatch_key_event(
+                "char",
+                text="\r",
+                unmodified_text="\r",
+                **key_options,
+            )
+        )
+        await tab.send(uc.cdp.input_.dispatch_key_event("keyUp", **key_options))
+        print("Sign-in retried with a trusted Enter key event.")
+        return True
+    except Exception as error:
+        print(f"Could not submit sign-in form: {error_summary(error)}")
         return False
 
 
@@ -178,19 +259,30 @@ async def send_prompt_after_creation(
         return False
 
 
-async def request_verification_code(
+async def prepare_verification_page(
     tab: uc.Tab,
     account: str,
     password: str,
 ) -> bool:
-    await click_when_present(tab, TRY_NOW_BUTTON, "Try Now")
-    await click_when_present(tab, CREATE_NOW_BUTTON, "Create Now")
-    await click_when_present(tab, TERMS_CHECKBOX, "Checkbox")
-    if not await fill_login_credentials(tab, account, password):
+    await click_when_present(tab, TRY_NOW_BUTTON, "Try Now", timeout=15)
+    await click_when_present(tab, CREATE_NOW_BUTTON, "Create Now", timeout=15)
+    if not await ensure_terms_accepted(tab, timeout=15):
         return False
-    if not await click_when_present(tab, SIGN_IN_BUTTON, "Sign in"):
+    if not await fill_login_credentials(tab, account, password, timeout=15):
         return False
-    return await click_when_present(tab, SEND_EMAIL_BUTTON, "Send Email")
+    if not await submit_sign_in(tab, timeout=15):
+        return False
+    try:
+        await find_element(tab, SEND_EMAIL_BUTTON, timeout=30)
+        print("Verification email page is ready.")
+        return True
+    except Exception as error:
+        await tab
+        current_url = urlsplit(tab.target.url)
+        current_page = f"{current_url.netloc}{current_url.path}"
+        print(f"Verification email page was not ready: {error_summary(error)}")
+        print(f"Current page after sign-in: {current_page}")
+        return False
 
 
 async def complete_creation_flow(tab: uc.Tab, otp: str) -> bool:
@@ -229,16 +321,23 @@ async def run_workflow(
     print(f"Loaded URL: {tab.target.url}")
     print(f"Page title: {tab.target.title}")
 
-    if not await request_verification_code(tab, account, password):
+    if not await prepare_verification_page(tab, account, password):
         return False
 
-    otp = await get_otp_from_tempmail(
+    inbox = await prepare_tempmail_inbox(
         browser,
         account,
         original_tab=tab,
-        timeout=5,
-        otp_timeout=args.otp_timeout,
+        timeout=15,
     )
+    if inbox is None:
+        return False
+
+    if not await click_when_present(tab, SEND_EMAIL_BUTTON, "Send Email"):
+        await close_tempmail_inbox(inbox)
+        return False
+
+    otp = await wait_for_otp_from_tempmail(inbox, args.otp_timeout)
     completed = bool(otp) and await complete_creation_flow(tab, otp)
     if args.screenshot:
         await save_screenshot(tab, args.screenshot)

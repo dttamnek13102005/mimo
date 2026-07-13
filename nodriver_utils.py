@@ -12,7 +12,7 @@ from nodriver.core.config import find_chrome_executable
 
 
 CSS = "css"
-XPATH = "xpath"
+TEXT = "text"
 Locator = tuple[str, str]
 
 
@@ -72,10 +72,13 @@ async def find_element(
 ) -> uc.Element:
     strategy, selector = locator
     if strategy == CSS:
-        element = await tab.select(selector, timeout=timeout)
-    elif strategy == XPATH:
-        matches = await tab.xpath(selector, timeout=timeout)
-        element = next((item for item in matches if item is not None), None)
+        element = await asyncio.wait_for(
+            tab.select(selector, timeout=timeout),
+            timeout=max(2.0, timeout + 2.0),
+        )
+    elif strategy == TEXT:
+        matches = await find_text_elements(tab, selector, timeout)
+        element = matches[0] if matches else None
     else:
         raise ValueError(f"Unsupported locator strategy: {strategy}")
 
@@ -91,21 +94,59 @@ async def find_elements(
 ) -> list[uc.Element]:
     strategy, selector = locator
     if strategy == CSS:
-        return await tab.select_all(selector, timeout=timeout)
-    if strategy == XPATH:
-        return [
-            item
-            for item in await tab.xpath(selector, timeout=timeout)
-            if item is not None
-        ]
+        return await asyncio.wait_for(
+            tab.select_all(selector, timeout=timeout),
+            timeout=max(2.0, timeout + 2.0),
+        )
+    if strategy == TEXT:
+        return await find_text_elements(tab, selector, timeout)
     raise ValueError(f"Unsupported locator strategy: {strategy}")
 
 
+async def find_text_elements(
+    tab: uc.Tab,
+    text: str,
+    timeout: float,
+) -> list[uc.Element]:
+    deadline = time.monotonic() + timeout
+    expected_text = " ".join(text.casefold().split())
+    while True:
+        try:
+            candidates = await asyncio.wait_for(
+                tab.select_all("button, a, [role='button']", timeout=0),
+                timeout=2,
+            )
+        except Exception:
+            if time.monotonic() >= deadline:
+                return []
+            await asyncio.sleep(0.25)
+            continue
+
+        matches = []
+        for element in candidates:
+            try:
+                actual_text = " ".join(element.text_all.casefold().split())
+                if expected_text in actual_text:
+                    position = await asyncio.wait_for(
+                        element.get_position(),
+                        timeout=1,
+                    )
+                    if position and position.width > 0 and position.height > 0:
+                        matches.append(
+                            (actual_text != expected_text, len(actual_text), element)
+                        )
+            except Exception:
+                continue
+        if matches:
+            matches.sort(key=lambda item: (item[0], item[1]))
+            return [item[2] for item in matches]
+        if time.monotonic() >= deadline:
+            return []
+        await asyncio.sleep(0.25)
+
+
 async def click_element(element: uc.Element) -> None:
-    try:
-        await element.mouse_click()
-    except Exception:
-        await element.click()
+    await element.click()
 
 
 async def click_when_present(
@@ -115,15 +156,22 @@ async def click_when_present(
     timeout: float = 3,
 ) -> bool:
     print(f"Waiting for '{element_name}'...")
-    try:
-        element = await find_element(tab, locator, timeout)
-        await click_element(element)
-        print(f"Clicked '{element_name}'.")
-        await tab.sleep(1)
-        return True
-    except Exception as error:
-        print(f"Could not click '{element_name}': {error_summary(error)}")
-        return False
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            remaining = max(0.5, deadline - time.monotonic())
+            element = await find_element(tab, locator, min(1.0, remaining))
+            await click_element(element)
+            print(f"Clicked '{element_name}'.")
+            await tab.sleep(1)
+            return True
+        except Exception as error:
+            last_error = error
+            await asyncio.sleep(0.25)
+    summary = error_summary(last_error) if last_error else "Timed out"
+    print(f"Could not click '{element_name}': {summary}")
+    return False
 
 
 async def replace_input(element: uc.Element, value: str) -> None:

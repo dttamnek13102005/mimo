@@ -28,3 +28,10 @@ Set `TELEGRAM_BOT_TOKEN`, install `requirements.txt`, and run:
 ```powershell
 python app.py --once
 ```
+
+The TempMail inbox is prepared before Xiaomi sends a verification email. Existing
+messages are recorded and ignored, so only a newly received email can provide the
+OTP. A failed account switches immediately to the next account; the configured
+rotation interval is applied only after a completed account session. If every
+account in a cycle fails, the worker waits five minutes before retrying so a
+website outage cannot create a tight retry loop.
