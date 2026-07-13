@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from pathlib import Path
+from typing import Any
+
+
+STUDIO_URL = "https://aistudio.xiaomimimo.com/"
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().with_name("accounts.json")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Automatically access the Xiaomi MiMo AI Studio website."
+    )
+    parser.add_argument("--url", default=STUDIO_URL, help="Website URL to open.")
+    parser.add_argument(
+        "--timeout", type=int, default=30,
+        help="Maximum seconds to wait for the page to load.",
+    )
+    parser.add_argument(
+        "--stay-seconds", type=int, default=20,
+        help="Seconds to keep the browser open before closing.",
+    )
+    parser.add_argument(
+        "--keep-open", action="store_true",
+        help="Leave Chrome open after the script finishes.",
+    )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="Run Chrome without showing a browser window.",
+    )
+    parser.add_argument(
+        "--screenshot", default="",
+        help="Optional path to save a screenshot after the page loads.",
+    )
+    parser.add_argument(
+        "--account", default="",
+        help="Xiaomi account email, phone, or ID.",
+    )
+    parser.add_argument(
+        "--password", default="",
+        help="Xiaomi account password.",
+    )
+    parser.add_argument(
+        "--otp-timeout", type=int, default=120,
+        help="Maximum seconds to wait for the first email and its OTP.",
+    )
+    parser.add_argument(
+        "--config", default=str(DEFAULT_CONFIG_PATH),
+        help="JSON file containing the account rotation settings.",
+    )
+    parser.add_argument(
+        "--once", action="store_true",
+        help="Run one account once instead of continuously rotating accounts.",
+    )
+    parser.add_argument(
+        "--test-rotation", action="store_true",
+        help="Run every enabled account once with no wait, then stop.",
+    )
+    parser.add_argument(
+        "--interval-hours", type=float, default=None,
+        help="Override the rotation interval from the config file.",
+    )
+    return parser.parse_args()
+
+
+def load_rotation_config(config_path: Path) -> dict[str, Any]:
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError as error:
+        raise ValueError(f"Config file was not found: {config_path}") from error
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"Config file is not valid JSON ({config_path}): {error}"
+        ) from error
+
+    if not isinstance(config, dict):
+        raise ValueError("Config root must be a JSON object.")
+
+    accounts = config.get("accounts")
+    if not isinstance(accounts, list) or not accounts:
+        raise ValueError("Config must contain a non-empty 'accounts' list.")
+
+    normalized_accounts = []
+    for position, item in enumerate(accounts, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Account #{position} must be a JSON object.")
+        if item.get("enabled", True) is False:
+            continue
+
+        account = str(item.get("account", "")).strip()
+        password = str(item.get("password", ""))
+        if not account or not password:
+            raise ValueError(
+                f"Enabled account #{position} must have 'account' and 'password'."
+            )
+        normalized_accounts.append({"account": account, "password": password})
+
+    if not normalized_accounts:
+        raise ValueError("Config does not contain any enabled accounts.")
+
+    try:
+        interval_hours = float(config.get("interval_hours", 4))
+    except (TypeError, ValueError) as error:
+        raise ValueError("'interval_hours' must be a number.") from error
+    if not math.isfinite(interval_hours) or interval_hours <= 0:
+        raise ValueError("'interval_hours' must be a finite number above zero.")
+
+    return {"interval_hours": interval_hours, "accounts": normalized_accounts}
+
+
+def apply_interval_override(
+    config: dict[str, Any], interval_hours: float | None
+) -> None:
+    if interval_hours is None:
+        return
+    if not math.isfinite(interval_hours) or interval_hours <= 0:
+        raise ValueError("--interval-hours must be a finite number above zero.")
+    config["interval_hours"] = interval_hours
